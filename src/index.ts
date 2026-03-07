@@ -24,10 +24,12 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!
 const JWT_SECRET = new TextEncoder().encode(process.env.JWT_SECRET!)
 const FRONTEND_URL = process.env.FRONTEND_URL ?? 'http://localhost:5173'
 
+const BACKEND_URL = process.env.BACKEND_URL ?? 'http://localhost:3000'
+
 const google = new Google(
   GOOGLE_CLIENT_ID,
   GOOGLE_CLIENT_SECRET,
-  'http://localhost:3000/api/auth/callback/google'
+  `${BACKEND_URL}/api/auth/callback/google`
 )
 
 // ─── Middleware ────────────────────────────────────────────────────────────────
