@@ -64,13 +64,15 @@ app.get('/api/auth/google', (c) => {
     httpOnly: true,
     maxAge: 600,
     path: '/',
-    sameSite: 'Lax',
+    secure: true,
+    sameSite: 'None',
   })
   setCookie(c, 'oauth_code_verifier', codeVerifier, {
     httpOnly: true,
     maxAge: 600,
     path: '/',
-    sameSite: 'Lax',
+    secure: true,
+    sameSite: 'None',
   })
 
   return c.redirect(url.toString())
@@ -140,7 +142,8 @@ app.get('/api/auth/callback/google', async (c) => {
     httpOnly: true,
     maxAge: 60 * 60 * 24 * 7, // 7 hari
     path: '/',
-    sameSite: 'Lax',
+    secure: true,
+    sameSite: 'None',
   })
 
   // Hapus cookie sementara
