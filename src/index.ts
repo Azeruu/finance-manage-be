@@ -144,28 +144,27 @@ app.get('/api/auth/callback/google', async (c) => {
     .setExpirationTime('7d')
     .sign(JWT_SECRET)
 
-  // Set JWT di cookie
-  setCookie(c, 'session', jwt, {
-    httpOnly: true,
-    maxAge: 60 * 60 * 24 * 7, // 7 hari
-    path: '/',
-    secure: true,
-    sameSite: 'None',
-  })
-
-  // Hapus cookie sementara
-  deleteCookie(c, 'oauth_state')
-  deleteCookie(c, 'oauth_code_verifier')
-
-  // Redirect ke frontend dashboard
-  return c.redirect(`${FRONTEND_URL}/dashboard`)
+  // Redirect ke frontend dengan token di URL
+  // Frontend yang akan menyimpan token ini secara lokal (localStorage/cookie first-party)
+  return c.redirect(`${FRONTEND_URL}/dashboard?token=${jwt}`)
 })
 
 /**
  * Middleware untuk mengecek User Authentication
+ * Sekarang mendukung pengambilan token dari Authorization header (Bearer token)
+ * selain dari Cookie, berguna untuk komunikasi API cross-domain
  */
 const authMiddleware = async (c: any, next: any) => {
-  const token = getCookie(c, 'session')
+  let token = getCookie(c, 'session')
+  
+  // Jika tidak ada di cookie, cari di Authorization header
+  if (!token) {
+    const authHeader = c.req.header('Authorization')
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      token = authHeader.substring(7)
+    }
+  }
+
   if (!token) return c.json({ error: 'Unauthorized' }, 401)
 
   try {
@@ -181,7 +180,16 @@ const authMiddleware = async (c: any, next: any) => {
  * GET /api/auth/me — return data user yang sedang login
  */
 app.get('/api/auth/me', async (c) => {
-  const token = getCookie(c, 'session')
+  let token = getCookie(c, 'session')
+  
+  // Jika tidak ada di cookie, cari di Authorization header
+  if (!token) {
+    const authHeader = c.req.header('Authorization')
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      token = authHeader.substring(7)
+    }
+  }
+
   if (!token) return c.json({ error: 'Unauthorized' }, 401)
 
   let payload
