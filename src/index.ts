@@ -8,6 +8,8 @@ import { SignJWT, jwtVerify } from 'jose'
 import pg from 'pg'
 import { PrismaPg } from '@prisma/adapter-pg'
 import { serve } from '@hono/node-server'
+import { secureHeaders } from 'hono/secure-headers'
+import { z } from 'zod'
 
 type Variables = {
   userId: string
@@ -33,13 +35,21 @@ const google = new Google(
 )
 
 // ─── Middleware ────────────────────────────────────────────────────────────────
+app.use('*', secureHeaders())
+
 app.use(
   '/*',
   cors({
     origin: (origin) => {
-      // Izinkan localhost untuk dev, dan domain Vercel / domain utama untuk prod
+      // Izinkan localhost untuk dev, dan domain spesifik untuk prod
+      const allowedOrigins = [
+        FRONTEND_URL,
+        'http://localhost:5173',
+        'https://finance-manage-fe.vercel.app' // Gantilah dengan domain Vercel yang sesuai jika sudah tetap
+      ]
+      
       if (!origin) return FRONTEND_URL
-      if (origin.includes('localhost') || origin.includes('vercel.app') || origin === FRONTEND_URL) {
+      if (allowedOrigins.includes(origin) || (origin.includes('localhost') && process.env.NODE_ENV !== 'production')) {
          return origin
       }
       return FRONTEND_URL
@@ -49,6 +59,61 @@ app.use(
     credentials: true,
   })
 )
+
+// ─── Rate Limiting ─────────────────────────────────────────────────────────────
+const rateLimitMap = new Map<string, { count: number; lastReset: number }>()
+const RATE_LIMIT_WINDOW = 60 * 1000 // 1 menit
+const MAX_REQUESTS = 100 // 100 request per menit per IP
+
+const rateLimitMiddleware = async (c: any, next: any) => {
+  const ip = c.req.header('x-forwarded-for') || 'anonymous'
+  const now = Date.now()
+  const record = rateLimitMap.get(ip) || { count: 0, lastReset: now }
+
+  if (now - record.lastReset > RATE_LIMIT_WINDOW) {
+    record.count = 1
+    record.lastReset = now
+  } else {
+    record.count++
+  }
+
+  rateLimitMap.set(ip, record)
+
+  if (record.count > MAX_REQUESTS) {
+    return c.json({ error: 'Too many requests, please try again later.' }, 429)
+  }
+
+  await next()
+}
+
+// ─── Zod Schemas ─────────────────────────────────────────────────────────────
+const incomeSchema = z.object({
+  month: z.coerce.number().min(1).max(12),
+  year: z.coerce.number().min(2000).max(2100),
+  salary: z.coerce.number().min(0),
+  atmBalance: z.coerce.number().min(0),
+})
+
+const expenseSchema = z.object({
+  month: z.coerce.number().min(1).max(12),
+  year: z.coerce.number().min(2000).max(2100),
+  name: z.string().min(1).max(100),
+  amount: z.coerce.number().min(0),
+})
+
+const savingSchema = z.object({
+  month: z.coerce.number().min(1).max(12),
+  year: z.coerce.number().min(2000).max(2100),
+  instrument: z.string().min(1).max(100),
+  amount: z.coerce.number().min(0),
+})
+
+const otherFundSchema = z.object({
+  month: z.coerce.number().min(1).max(12),
+  year: z.coerce.number().min(2000).max(2100),
+  name: z.string().min(1).max(100),
+  amount: z.coerce.number().min(0),
+})
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.get('/', (c) => c.text('Finance API is running!'))
@@ -85,10 +150,8 @@ app.get('/api/auth/google', (c) => {
   return c.redirect(url.toString())
 })
 
-/**
- * Step 2: Google redirect balik ke sini dengan code & state
- */
-app.get('/api/auth/callback/google', async (c) => {
+// Gunakan rate limiting pada callback juga untuk mencegah brute force
+app.get('/api/auth/callback/google', rateLimitMiddleware, async (c) => {
   const { code, state } = c.req.query()
   const storedState = getCookie(c, 'oauth_state')
   const storedVerifier = getCookie(c, 'oauth_code_verifier')
@@ -239,27 +302,34 @@ const userId = c.get('userId')
 })
 
 app.post('/api/income', authMiddleware, async (c) => {
-const userId = c.get('userId')
-  const { month, year, salary, atmBalance } = await c.req.json()
+  const userId = c.get('userId')
+  const body = await c.req.json()
+  
+  const result = incomeSchema.safeParse(body)
+  if (!result.success) {
+    return c.json({ error: 'Invalid input', details: result.error.format() }, 400)
+  }
+
+  const { month, year, salary, atmBalance } = result.data
 
   const income = await prisma.income.upsert({
     where: {
       userId_month_year: {
         userId,
-        month: parseInt(month),
-        year: parseInt(year)
+        month,
+        year
       }
     },
     update: {
-      salary: parseFloat(salary),
-      atmBalance: parseFloat(atmBalance)
+      salary,
+      atmBalance
     },
     create: {
       userId,
-      month: parseInt(month),
-      year: parseInt(year),
-      salary: parseFloat(salary),
-      atmBalance: parseFloat(atmBalance)
+      month,
+      year,
+      salary,
+      atmBalance
     }
   })
   return c.json(income)
@@ -289,16 +359,23 @@ const userId = c.get('userId')
 })
 
 app.post('/api/expense', authMiddleware, async (c) => {
-const userId = c.get('userId')
-  const { month, year, name, amount } = await c.req.json()
+  const userId = c.get('userId')
+  const body = await c.req.json()
+
+  const result = expenseSchema.safeParse(body)
+  if (!result.success) {
+    return c.json({ error: 'Invalid input', details: result.error.format() }, 400)
+  }
+
+  const { month, year, name, amount } = result.data
 
   const expense = await prisma.expense.create({
     data: {
       userId,
-      month: parseInt(month),
-      year: parseInt(year),
+      month,
+      year,
       name,
-      amount: parseFloat(amount)
+      amount
     }
   })
   return c.json(expense)
@@ -337,16 +414,23 @@ const userId = c.get('userId')
 })
 
 app.post('/api/saving', authMiddleware, async (c) => {
-const userId = c.get('userId')
-  const { month, year, instrument, amount } = await c.req.json()
+  const userId = c.get('userId')
+  const body = await c.req.json()
+
+  const result = savingSchema.safeParse(body)
+  if (!result.success) {
+    return c.json({ error: 'Invalid input', details: result.error.format() }, 400)
+  }
+
+  const { month, year, instrument, amount } = result.data
 
   const saving = await prisma.saving.create({
     data: {
       userId,
-      month: parseInt(month),
-      year: parseInt(year),
+      month,
+      year,
       instrument,
-      amount: parseFloat(amount)
+      amount
     }
   })
   return c.json(saving)
@@ -385,16 +469,23 @@ const userId = c.get('userId')
 })
 
 app.post('/api/other-fund', authMiddleware, async (c) => {
-const userId = c.get('userId')
-  const { month, year, name, amount } = await c.req.json()
+  const userId = c.get('userId')
+  const body = await c.req.json()
+
+  const result = otherFundSchema.safeParse(body)
+  if (!result.success) {
+    return c.json({ error: 'Invalid input', details: result.error.format() }, 400)
+  }
+
+  const { month, year, name, amount } = result.data
 
   const fund = await prisma.otherFund.create({
     data: {
       userId,
-      month: parseInt(month),
-      year: parseInt(year),
+      month,
+      year,
       name,
-      amount: parseFloat(amount)
+      amount
     }
   })
   return c.json(fund)
