@@ -119,6 +119,11 @@ const otherFundSchema = z.object({
 app.get('/', (c) => c.text('Finance API is running!'))
 
 /**
+ * Public ping endpoint for uptime monitoring (e.g., UptimeRobot)
+ */
+app.get('/api/ping', (c) => c.json({ status: 'ok', timestamp: new Date().toISOString() }))
+
+/**
  * Step 1: Redirect ke Google OAuth consent screen
  */
 app.get('/api/auth/google', (c) => {
