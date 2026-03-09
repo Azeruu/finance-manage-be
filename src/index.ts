@@ -10,6 +10,7 @@ import { PrismaPg } from '@prisma/adapter-pg'
 import { serve } from '@hono/node-server'
 import { secureHeaders } from 'hono/secure-headers'
 import { z } from 'zod'
+import { google as googleapis } from 'googleapis'
 
 type Variables = {
   userId: string
@@ -28,11 +29,122 @@ const FRONTEND_URL = process.env.FRONTEND_URL ?? 'http://localhost:5173'
 
 const BACKEND_URL = process.env.BACKEND_URL ?? 'http://localhost:3000'
 
-const google = new Google(
+const googleAuth = new Google(
   GOOGLE_CLIENT_ID,
   GOOGLE_CLIENT_SECRET,
   `${BACKEND_URL}/api/auth/callback/google`
 )
+
+// Google API Client Helpers
+function getOAuth2Client(refreshToken?: string | null) {
+  const oauth2Client = new googleapis.auth.OAuth2(
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET,
+    `${BACKEND_URL}/api/auth/callback/google`
+  )
+
+  if (refreshToken) {
+    oauth2Client.setCredentials({ refresh_token: refreshToken })
+  }
+
+  return oauth2Client
+}
+
+// Google Sheets Config
+const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID?.replace(/^"|"$/g, '')
+const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID?.replace(/^"|"$/g, '')
+const GOOGLE_SHEET_TEMPLATE_ID = process.env.GOOGLE_SHEET_TEMPLATE_ID?.replace(/^"|"$/g, '')
+const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL?.replace(/^"|"$/g, '')
+const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY
+  ?.replace(/^"|"$/g, '')
+  ?.replace(/\\n/g, '\n')
+
+// Kita tidak lagi menggunakan Service Account JWT secara global
+// Tapi kita simpan API instance-nya saja
+const sheets = googleapis.sheets('v4')
+const drive = googleapis.drive('v3')
+
+async function createSheetForUser(userName: string, userEmail: string, refreshToken: string) {
+  const auth = getOAuth2Client(refreshToken)
+
+  try {
+    console.log(`Starting spreadsheet creation for user: ${userEmail}`)
+    
+    let spreadsheetId: string | null = null;
+
+    if (GOOGLE_SHEET_TEMPLATE_ID) {
+      console.log(`Copying from template: ${GOOGLE_SHEET_TEMPLATE_ID}`)
+      const copyResponse = await drive.files.copy({
+        auth,
+        fileId: GOOGLE_SHEET_TEMPLATE_ID,
+        requestBody: {
+          name: `Finance Manager - ${userName}`,
+          // Kita tidak perlu folder ID jika ini di Drive user sendiri
+        }
+      });
+      spreadsheetId = copyResponse.data.id || null;
+    } else {
+      const spreadsheet = await sheets.spreadsheets.create({
+        auth,
+        requestBody: {
+          properties: {
+            title: `Finance Manager - ${userName}`
+          }
+        }
+      });
+      spreadsheetId = spreadsheet.data.spreadsheetId || null;
+
+      if (spreadsheetId) {
+        await sheets.spreadsheets.values.update({
+          auth,
+          spreadsheetId: spreadsheetId,
+          range: 'Sheet1!A1',
+          valueInputOption: 'USER_ENTERED',
+          requestBody: {
+            values: [['Tanggal', 'Nama', 'Jumlah', 'Kategori', 'Metode']]
+          }
+        });
+      }
+    }
+
+    console.log(`Spreadsheet ready on user's drive: ${spreadsheetId}`)
+    return spreadsheetId
+  } catch (error: any) {
+    console.error('Error creating spreadsheet on user drive:', error.message)
+    return null
+  }
+}
+
+async function appendToSheet(spreadsheetId: string | null, refreshToken: string | null, data: any[]) {
+  if (!spreadsheetId || !refreshToken) {
+    console.warn('[Spreadsheet] Missing ID or Refresh Token. Skipping.')
+    return
+  }
+
+  const auth = getOAuth2Client(refreshToken)
+
+  try {
+    const spreadsheet = await sheets.spreadsheets.get({
+      auth,
+      spreadsheetId: spreadsheetId,
+    })
+    
+    const firstSheetName = spreadsheet.data.sheets?.[0]?.properties?.title || 'Sheet1'
+
+    await sheets.spreadsheets.values.append({
+      auth,
+      spreadsheetId: spreadsheetId,
+      range: `${firstSheetName}!A:E`,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: {
+        values: [data],
+      }
+    })
+    console.log(`Successfully appended to User's Google Sheet ${spreadsheetId}`)
+  } catch (error: any) {
+    console.error('[Spreadsheet] Error appending:', error.message)
+  }
+}
 
 // ─── Middleware ────────────────────────────────────────────────────────────────
 app.use('*', secureHeaders())
@@ -41,14 +153,14 @@ app.use(
   '/*',
   cors({
     origin: (origin) => {
-      // Izinkan localhost untuk dev, dan domain spesifik untuk prod
+      // Izinkan localhost untuk dev, dan domain spesifik untuk prod dari ENV
       const allowedOrigins = [
         FRONTEND_URL,
         'http://localhost:5173',
-        'https://finance-manage-fe.vercel.app' // Gantilah dengan domain Vercel yang sesuai jika sudah tetap
       ]
       
       if (!origin) return FRONTEND_URL
+      // Izinkan localhost hanya jika bukan mode produksi (opsional, tapi lebih aman)
       if (allowedOrigins.includes(origin) || (origin.includes('localhost') && process.env.NODE_ENV !== 'production')) {
          return origin
       }
@@ -59,6 +171,18 @@ app.use(
     credentials: true,
   })
 )
+
+// Global Error Handler untuk menyembunyikan stack trace di produksi
+app.onError((err, c) => {
+  console.error(`[Global Error]: ${err.message}`, err.stack)
+  
+  const status = (err as any).status || 500
+  const message = process.env.NODE_ENV === 'production' 
+    ? 'Internal Server Error' 
+    : err.message
+
+  return c.json({ error: message }, status)
+})
 
 // ─── Rate Limiting ─────────────────────────────────────────────────────────────
 const rateLimitMap = new Map<string, { count: number; lastReset: number }>()
@@ -115,6 +239,14 @@ const otherFundSchema = z.object({
   amount: z.coerce.number().min(0),
 })
 
+const recentExpenseSchema = z.object({
+  name: z.string().min(1).max(100),
+  amount: z.coerce.number().min(0),
+  category: z.string().min(1).max(50),
+  paymentMethod: z.string().min(1).max(50),
+  date: z.string().datetime(), // Format ISO string dari frontend
+})
+
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.get('/', (c) => c.text('Finance API is running!'))
 
@@ -130,11 +262,17 @@ app.get('/api/auth/google', (c) => {
   const state = generateState()
   const codeVerifier = generateCodeVerifier()
 
-  const url = google.createAuthorizationURL(state, codeVerifier, [
+  const url = googleAuth.createAuthorizationURL(state, codeVerifier, [
     'openid',
     'profile',
     'email',
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive.file'
   ])
+
+  // Tambahkan prompt consent & access_type offline untuk mendapatkan refresh token
+  url.searchParams.set('prompt', 'consent')
+  url.searchParams.set('access_type', 'offline')
 
   // Simpan state & codeVerifier di cookie (httpOnly, 10 menit)
   setCookie(c, 'oauth_state', state, {
@@ -169,10 +307,12 @@ app.get('/api/auth/callback/google', rateLimitMiddleware, async (c) => {
   // Tukar authorization code dengan access token
   let tokens
   try {
-    tokens = await google.validateAuthorizationCode(code, storedVerifier)
+    tokens = await googleAuth.validateAuthorizationCode(code, storedVerifier)
   } catch {
     return c.json({ error: 'Failed to exchange code for token' }, 400)
   }
+
+  const refreshToken = tokens.refreshToken()
 
   // Ambil data user dari Google
   const googleRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
@@ -191,20 +331,33 @@ app.get('/api/auth/callback/google', rateLimitMiddleware, async (c) => {
   }
 
   // Upsert user ke database
-  const user = await prisma.user.upsert({
+  let user = await prisma.user.upsert({
     where: { googleId: googleUser.id },
     update: {
       email: googleUser.email,
       name: googleUser.name,
       avatar: googleUser.picture,
+      ...(refreshToken ? { refreshToken } : {}),
     },
     create: {
       email: googleUser.email,
       name: googleUser.name,
       avatar: googleUser.picture,
       googleId: googleUser.id,
+      refreshToken,
     },
   })
+
+  // Jika user belum punya googleSheetId, buatkan sekarang
+  if (!user.googleSheetId && user.refreshToken) {
+    const sheetId = await createSheetForUser(googleUser.name, googleUser.email, user.refreshToken)
+    if (sheetId) {
+      user = await prisma.user.update({
+        where: { id: user.id },
+        data: { googleSheetId: sheetId }
+      })
+    }
+  }
 
   // Buat JWT session (berlaku 7 hari)
   const jwt = await new SignJWT({ sub: user.id, email: user.email })
@@ -270,7 +423,7 @@ app.get('/api/auth/me', async (c) => {
 
   const user = await prisma.user.findUnique({
     where: { id: payload.sub as string },
-    select: { id: true, name: true, email: true, avatar: true },
+    select: { id: true, name: true, email: true, avatar: true }, // Jangan kirim refreshToken atau googleSheetId yang tak perlu
   })
 
   if (!user) return c.json({ error: 'User not found' }, 404)
@@ -284,6 +437,58 @@ app.get('/api/auth/me', async (c) => {
 app.post('/api/auth/logout', (c) => {
   deleteCookie(c, 'session')
   return c.json({ success: true })
+})
+
+/**
+ * GET /api/auth/google-sheet-url — return URL spreadsheet user
+ */
+app.get('/api/auth/google-sheet-url', authMiddleware, async (c) => {
+  const userId = c.get('userId')
+  let user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { id: true, googleSheetId: true, name: true, email: true, refreshToken: true }
+  })
+
+  if (!user) return c.json({ error: 'User not found' }, 404)
+
+  // Jika belum ada sheetId, coba buatkan sekarang (On-demand)
+  if (!user.googleSheetId && user.refreshToken) {
+    console.log(`User ${user.email} requested sheet but doesn't have one. Creating now...`)
+    const sheetId = await createSheetForUser(user.name || 'User', user.email, user.refreshToken)
+    if (sheetId) {
+      user = await prisma.user.update({
+        where: { id: userId },
+        data: { googleSheetId: sheetId },
+        select: { id: true, googleSheetId: true, name: true, email: true, refreshToken: true }
+      })
+    } else {
+      return c.json({ error: 'Gagal membuat spreadsheet otomatis. Pastikan izin Google Sheets sudah diberikan saat login.' }, 500)
+    }
+  }
+
+  return c.json({ url: `https://docs.google.com/spreadsheets/d/${user.googleSheetId}` })
+})
+
+/**
+ * POST /api/auth/google-sheet-id — simpan ID spreadsheet secara manual
+ */
+app.post('/api/auth/google-sheet-id', authMiddleware, async (c) => {
+  const userId = c.get('userId')
+  const { sheetId } = await c.req.json()
+
+  if (!sheetId) return c.json({ error: 'ID Spreadsheet wajib diisi' }, 400)
+
+  // Ekstrak ID jika user memasukkan full URL
+  let finalId = sheetId
+  const match = sheetId.match(/\/d\/([a-zA-Z0-9-_]+)/)
+  if (match) finalId = match[1]
+
+  await prisma.user.update({
+    where: { id: userId },
+    data: { googleSheetId: finalId }
+  })
+
+  return c.json({ success: true, sheetId: finalId })
 })
 
 // ─── Financial Records Routes ────────────────────────────────────────────────────────
@@ -403,6 +608,72 @@ const userId = c.get('userId')
     _sum: { amount: true }
   })
   return c.json({ totalExpense: agg._sum.amount ?? 0 })
+})
+
+// 2.1 Recent Expense (Detail pengeluaran terkini)
+app.post('/api/recent-expense', authMiddleware, async (c) => {
+  const userId = c.get('userId')
+  const body = await c.req.json()
+
+  const result = recentExpenseSchema.safeParse(body)
+  if (!result.success) {
+    return c.json({ error: 'Invalid input', details: result.error.format() }, 400)
+  }
+
+  const { name, amount, category, paymentMethod, date } = result.data
+  const d = new Date(date)
+  const month = d.getMonth() + 1
+  const year = d.getFullYear()
+
+  // Simpan ke RecentExpense (Tabel detail)
+  const recentExpense = await prisma.recentExpense.create({
+    data: {
+      userId,
+      name,
+      amount,
+      category,
+      paymentMethod,
+      month,
+      year,
+      createdAt: d
+    }
+  })
+
+  // Simpan juga ke tabel Expense (hanya data relevan)
+  await prisma.expense.create({
+    data: {
+      userId,
+      name,
+      amount,
+      month,
+      year,
+      createdAt: d
+    }
+  })
+
+  // Ambil user untuk mendapatkan googleSheetId & refreshToken
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { googleSheetId: true, refreshToken: true }
+  })
+
+  // Kirim ke Google Sheets
+  // Format data: Tanggal, Nama, Jumlah, Kategori, Metode
+  const day = String(d.getDate()).padStart(2, '0')
+  const monthStr = String(d.getMonth() + 1).padStart(2, '0')
+  const yearStr = d.getFullYear()
+  const dateStr = `${day}/${monthStr}/${yearStr}`
+
+  const sheetData = [
+    dateStr,
+    name,
+    amount,
+    category,
+    paymentMethod
+  ]
+  await appendToSheet(user?.googleSheetId || null, user?.refreshToken || null, sheetData)
+
+  return c.json(recentExpense)
 })
 
 // 3. Saving (Tabungan)

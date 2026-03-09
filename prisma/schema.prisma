@@ -14,18 +14,21 @@ datasource db {
 }
 
 model User {
-  id        String    @id @default(uuid())
-  email     String    @unique
-  name      String?
-  avatar    String?
-  googleId  String    @unique
-  createdAt DateTime  @default(now())
+  id            String    @id @default(uuid())
+  email         String    @unique
+  name          String?
+  avatar        String?
+  googleId      String    @unique
+  googleSheetId String?   // Menyimpan ID Spreadsheet unik per user
+  refreshToken  String?   // Menyimpan Google Refresh Token untuk akses jangka panjang
+  createdAt     DateTime  @default(now())
 
   // Relations
-  incomes    Income[]
-  expenses   Expense[]
-  savings    Saving[]
-  otherFunds OtherFund[]
+  incomes        Income[]
+  expenses       Expense[]
+  savings        Saving[]
+  otherFunds     OtherFund[]
+  recentExpenses RecentExpense[]
 }
 
 model Income {
@@ -52,6 +55,20 @@ model Expense {
   createdAt DateTime @default(now())
 
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model RecentExpense {
+  id            String   @id @default(uuid())
+  userId        String
+  month         Int
+  year          Int
+  name          String
+  amount        Float
+  category      String
+  paymentMethod String
+  createdAt     DateTime @default(now())
+
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
 model Saving {
